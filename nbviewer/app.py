@@ -36,6 +36,9 @@ from .github import AsyncGitHubClient
 from .log import log_request
 from .utils import git_info, ipython_info
 
+import nbviewer.model as db
+from nbviewer.config import web as webconf
+
 #-----------------------------------------------------------------------------
 # Code
 #-----------------------------------------------------------------------------
@@ -173,6 +176,7 @@ def main():
         pool=pool,
         gzip=True,
         render_timeout=20,
+        cookie_secret=webconf.cookie_secret,
         localfile_path=os.path.abspath(options.localfiles),
         fetch_kwargs=dict(
             connect_timeout=10,
@@ -186,6 +190,7 @@ def main():
         handlers.insert(0, (r'/localfile/(.*)', LocalFileHandler))
 
     app = web.Application(handlers, debug=options.debug, **settings)
+    app.db = db.MomokoDB()
     http_server = httpserver.HTTPServer(app, xheaders=True)
     log.app_log.info("Listening on port %i", options.port)
     http_server.listen(options.port)

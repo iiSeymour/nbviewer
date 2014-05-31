@@ -137,4 +137,3 @@ class AsyncGitHubClient(object):
         
         self.get_tree(user, repo, ref=ref, callback=cb, **kwargs)
         return f
-    

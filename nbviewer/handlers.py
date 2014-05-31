@@ -43,6 +43,9 @@ from IPython.html import DEFAULT_STATIC_FILES_PATH as ipython_static_path
 from .render import render_notebook, NbFormatError
 from .utils import transform_ipynb_uri, quote, response_text, base64_decode, parse_header_links
 
+from nbviewer.config import web as webconf
+from nbviewer.github_auth import GithubMixin
+
 date_fmt = "%a, %d %h %Y %H:%M:%S UTC"
 
 #-----------------------------------------------------------------------------
@@ -96,7 +99,26 @@ class BaseHandler(web.RequestHandler):
     def frontpage_sections(self):
         return self.settings.setdefault('frontpage_sections', {})
     
-    #---------------------------------------------------------------
+    @property
+    def current_user(self):
+        github_id = self.get_secure_cookie('github_id')
+        if github_id is not None:
+            return {'github_id': int(github_id),
+                    'username': self.get_secure_cookie('username'),
+                    'avatar_url': self.get_secure_cookie('avatar_url')}
+
+    @property
+    def db(self):
+        return self.application.db
+
+    @property
+    @gen.coroutine
+    def access_token(self):
+        github_user = self.current_user
+        token = yield self.db.get_user(github_user['github_id'])
+        raise gen.Return(token[2])
+
+   #---------------------------------------------------------------
     # template rendering
     #---------------------------------------------------------------
     
@@ -419,7 +441,7 @@ def cached(method):
 class RenderingHandler(BaseHandler):
     """Base for handlers that render notebooks"""
     
-    # notebook caches based on path (no url params)
+    # notebook caches based on path (no url param)
     _cache_key_attr = 'path'
     
     @property
@@ -547,6 +569,8 @@ class UserGistsHandler(BaseHandler):
         if page:
             params['page'] = page
         
+        params['access_token'] = yield self.access_token
+        
         with self.catch_client_error():
             response = yield self.github_client.get_gists(user, params=params)
         
@@ -575,8 +599,10 @@ class GistHandler(RenderingHandler):
     @cached
     @gen.coroutine
     def get(self, user, gist_id, filename=''):
+        params = {}
+        params['access_token'] = yield self.access_token
         with self.catch_client_error():
-            response = yield self.github_client.get_gist(gist_id)
+            response = yield self.github_client.get_gist(gist_id, params=params)
         
         gist = json.loads(response_text(response))
         gist_id=gist['id']
@@ -672,10 +698,12 @@ class GitHubUserHandler(BaseHandler):
     def get(self, user):
         page = self.get_argument("page", None)
         params = {'sort' : 'updated'}
+        params['access_token'] = yield self.access_token
+        
         if page:
             params['page'] = page
         with self.catch_client_error():
-            response = yield self.github_client.get_repos(user, params=params)
+            response = yield self.github_client.get_repos(user)
         
         prev_url, next_url = self.get_page_links(response)
         repos = json.loads(response_text(response))
@@ -709,8 +737,11 @@ class GitHubTreeHandler(BaseHandler):
             self.redirect(self.request.uri + '/')
             return
         path = path.rstrip('/')
+        params = {}
+        params['access_token'] = yield self.access_token
+
         with self.catch_client_error():
-            response = yield self.github_client.get_contents(user, repo, path, ref=ref)
+            response = yield self.github_client.get_contents(user, repo, path, ref=ref, params=params)
         
         contents = json.loads(response_text(response))
         if not isinstance(contents, list):
@@ -792,6 +823,10 @@ class GitHubBlobHandler(RenderingHandler):
     @cached
     @gen.coroutine
     def get(self, user, repo, ref, path):
+
+        params = {}
+        params['access_token'] = yield self.access_token
+
         raw_url = u"https://raw.githubusercontent.com/{user}/{repo}/{ref}/{path}".format(
             user=user, repo=repo, ref=ref, path=quote(path)
         )
@@ -800,7 +835,7 @@ class GitHubBlobHandler(RenderingHandler):
         )
         with self.catch_client_error():
             tree_entry = yield self.github_client.get_tree_entry(
-                user, repo, path=path, ref=ref
+                user, repo, path=path, ref=ref, params=params
             )
         
         if tree_entry['type'] == 'tree':
@@ -813,7 +848,7 @@ class GitHubBlobHandler(RenderingHandler):
         
         # fetch file data from the blobs API
         with self.catch_client_error():
-            response = yield self.github_client.fetch(tree_entry['url'])
+            response = yield self.github_client.fetch(tree_entry['url'], params=params)
         
         data = json.loads(response_text(response))
         contents = data['content']
@@ -907,6 +942,53 @@ class LocalFileHandler(RenderingHandler):
 
 
 #-----------------------------------------------------------------------------
+# Auth Handlers
+#-----------------------------------------------------------------------------
+
+class LoginHandler(BaseHandler, GithubMixin):
+
+    @gen.coroutine
+    def get(self):
+
+        if self.get_argument('code', False):
+            auth_url = webconf.host + '/auth/github'
+            code = self.get_argument('code')
+            github_user = yield self.get_authenticated_user(redirect_uri=auth_url, code=code)
+            exists = yield self.db.update_access_token(github_user)
+
+            if exists:
+                yield self.create_session(github_user['id'])
+                self.redirect('/')
+            else:
+                yield self.db.create_user(github_user)
+                headers = {'Accept': 'application/vnd.github.v3'}
+                emails = yield self.github_request('/user/emails', github_user['access_token'], headers=headers)
+
+                for email in emails:
+                    if email['verified']:
+                        break
+                    
+                yield self.db.set_contact_info(github_user['id'], email['email'])
+                yield self.create_session(github_user['id'])
+                self.redirect('/')
+        else:
+            self.authorize_redirect(redirect_uri=webconf.host + '/auth/github', scope=['user:email,repo'])
+
+    @gen.coroutine
+    def create_session(self, github_id):
+        user = yield self.db.get_user(github_id)
+        email = yield self.db.get_contact_info(github_id)
+        self.set_secure_cookie('github_id', str(user['github_id']))
+        self.set_secure_cookie('username', user['username'])
+        self.set_secure_cookie('avatar_url', self.avatar_url(user['username'], email))
+
+
+class LogoutHandler(BaseHandler):
+    def get(self):
+        self.clear_all_cookies()
+        self.redirect('/')
+
+#-----------------------------------------------------------------------------
 # Default handler URL mapping
 #-----------------------------------------------------------------------------
 
@@ -916,6 +998,9 @@ handlers = [
     (r'/faq/?', FAQHandler),
     (r'/create/?', CreateHandler),
     (r'/ipython-static/(.*)', web.StaticFileHandler, dict(path=ipython_static_path)),
+
+    (r'/auth/github', LoginHandler),
+    (r'/auth/logout', LogoutHandler),
     
     # don't let super old browsers request data-uris
     (r'.*/data:.*;base64,.*', Custom404),
